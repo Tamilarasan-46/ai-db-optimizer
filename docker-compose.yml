@@ -1,0 +1,93 @@
+# ============================================================================
+# AI Database Optimizer — canonical stack
+# ----------------------------------------------------------------------------
+# Quick start:
+#   cp .env.example .env        (works as-is; edit to taste)
+#   docker compose up --build
+#   open http://localhost:8080  -> demo database is analysed out of the box
+#
+# To analyse YOUR PostgreSQL: use the "＋ Connect database…" form in the UI
+# header, or set TARGET_DATABASE_URL in .env (durable). Analysis is always
+# READ-ONLY. See README.md -> "Connect your own database".
+#
+# Everything is configurable via .env — ports, credentials, model. All host
+# ports bind to 127.0.0.1 only (change BIND_ADDR to 0.0.0.0 to expose on LAN,
+# and put real passwords in .env first if you do).
+# ============================================================================
+
+services:
+  postgres:
+    # PG16 + pgvector: the optimizer's own storage (findings, insights,
+    # embeddings) AND the built-in demo database. Not your data.
+    image: pgvector/pgvector:${PG_IMAGE_TAG:-pg16}
+    container_name: ai-opt-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_SUPERUSER_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:-optimizer_local_pw}
+      POSTGRES_DB: ${AI_OPTIMIZER_DB:-ai_optimizer_db}
+      AI_OPTIMIZER_USER: ${AI_OPTIMIZER_USER:-ai_optimizer_user}
+      AI_OPTIMIZER_PASSWORD: ${AI_OPTIMIZER_PASSWORD:-optimizer_app_pw}
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${STORAGE_DB_PORT:-5433}:5432"
+    volumes:
+      - pgdata_ai_optimizer:/var/lib/postgresql/data
+      - ./db-init-container:/docker-entrypoint-initdb.d          # role + extensions + demo seed (first boot only)
+      - ./seed-ai-optimizer-db.sql:/seed/seed-ai-optimizer-db.sql:ro
+    command: >
+      postgres
+      -c shared_preload_libraries=pg_stat_statements
+      -c pg_stat_statements.track=all
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_SUPERUSER_USER:-postgres} -d ${AI_OPTIMIZER_DB:-ai_optimizer_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 180s          # first boot seeds the demo dataset
+
+  backend:
+    build: ./backend
+    container_name: ai-opt-backend
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${BACKEND_PORT:-8000}:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # reach the host machine's Postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ai-service:
+        condition: service_started
+    volumes:
+      - ./backend:/app
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  ai-service:
+    build: ./ai-service
+    container_name: ai-opt-ai
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${AI_SERVICE_PORT:-5000}:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./ai-service:/app
+
+  frontend:
+    build: ./frontend
+    container_name: ai-opt-frontend
+    restart: unless-stopped
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${FRONTEND_PORT:-8080}:8080"
+    depends_on:
+      - backend
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    command: npm run dev -- --host 0.0.0.0 --port 8080
+
+volumes:
+  pgdata_ai_optimizer:

@@ -1,0 +1,60 @@
+# ============================================================================
+# docker-compose.external-db.yml   —  OPTION A: EXTERNAL Postgres
+# ----------------------------------------------------------------------------
+# This compose file does NOT run or manage any database. It expects an
+# EXTERNAL, already-running PostgreSQL instance (your native/host Postgres)
+# that you have prepared with setup-ai-optimizer-db.sql.
+#
+# The app reaches that host DB via `host.docker.internal` (see DATABASE_URL in
+# .env). Nothing here can touch your production data beyond the read-only stats
+# access you granted to ai_optimizer_user.
+#
+# ISOLATION CAVEAT: pg_stat_statements is cluster-wide. If ai_optimizer_db lives
+# in the SAME Postgres cluster as production, the app will still see normalized
+# query text from all databases in that cluster. For a fully separate cluster,
+# use docker-compose.new-container.yml instead.
+#
+# RUN:  docker compose -f docker-compose.external-db.yml up --build
+#
+# All host ports are bound to 127.0.0.1 so nothing is exposed to your LAN.
+# ============================================================================
+version: '3.8'
+
+services:
+  backend:
+    build: ./backend
+    container_name: ai-opt-backend
+    env_file: .env                      # DATABASE_URL, AI_SERVICE_URL come from here
+    ports:
+      - "127.0.0.1:8000:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # lets the container reach host Postgres
+    depends_on:
+      ai-service:
+        condition: service_started
+    volumes:
+      - ./backend:/app
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  ai-service:
+    build: ./ai-service
+    container_name: ai-opt-ai
+    env_file: .env                      # DATABASE_URL, EMBEDDING_MODEL come from here
+    ports:
+      - "127.0.0.1:5000:5000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./ai-service:/app
+
+  frontend:
+    build: ./frontend
+    container_name: ai-opt-frontend
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      - backend
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    command: npm run dev -- --host 0.0.0.0 --port 8080

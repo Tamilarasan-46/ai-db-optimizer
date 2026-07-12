@@ -1,0 +1,102 @@
+# ============================================================================
+# docker-compose.new-container.yml   —  OPTION B: SEPARATE isolated Postgres
+# ----------------------------------------------------------------------------
+# Spins up a BRAND-NEW PostgreSQL in its OWN container, its OWN cluster, and its
+# OWN named volume — completely separate from any Postgres already running on
+# your machine. Published to the host ONLY as 127.0.0.1:5433 (so it can never
+# collide with, or be confused for, a native Postgres on 5432).
+#
+# This is the RECOMMENDED option for true isolation: because it is a distinct
+# cluster, pg_stat_statements here contains ONLY this prototype's own workload —
+# your production database is not in this cluster and cannot be observed.
+#
+# On first start (empty volume) it auto-runs db-init-container/*.sh to create
+# the non-superuser app role + extensions. Load demo data afterwards with
+# seed-ai-optimizer-db.sql (see SETUP-CHECKLIST.md).
+#
+# RUN:  docker compose -f docker-compose.new-container.yml up --build
+#
+# Make sure .env has the Option B DATABASE_URL (host = postgres, port 5432).
+# ============================================================================
+
+services:
+  postgres:
+    # PG12 + pgvector on purpose: your native Postgres is 12.18, and backend/main.py
+    # reads pg_stat_statements columns `mean_time`/`total_time` (the PG12 / 1.7 names,
+    # renamed to *_exec_time in PG13+). Matching PG12 keeps those queries working AND
+    # gives us pgvector, which your native PG12 does not have.
+    # If the pg12 tag ever 404s, use a pinned tag e.g. pgvector/pgvector:0.8.0-pg12.
+    image: pgvector/pgvector:pg12
+    container_name: ai-opt-db-isolated
+    environment:
+      # Superuser bootstrap (from .env). The app does NOT use this account.
+      POSTGRES_USER: ${POSTGRES_SUPERUSER_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD}
+      POSTGRES_DB: ${AI_OPTIMIZER_DB}
+      # Passed through so the init script can create the app role.
+      AI_OPTIMIZER_USER: ${AI_OPTIMIZER_USER}
+      AI_OPTIMIZER_PASSWORD: ${AI_OPTIMIZER_PASSWORD}
+    ports:
+      - "127.0.0.1:5433:5432"           # host 5433 -> container 5432, localhost only
+    volumes:
+      - pgdata_ai_optimizer:/var/lib/postgresql/data              # dedicated, separate volume
+      - ./db-init-container:/docker-entrypoint-initdb.d           # runs once on first init (role, extensions, seed)
+      - ./seed-ai-optimizer-db.sql:/seed/seed-ai-optimizer-db.sql:ro  # canonical seed, used by 02-seed.sh
+    command: >
+      postgres
+      -c shared_preload_libraries=pg_stat_statements
+      -c pg_stat_statements.track=all
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_SUPERUSER_USER} -d ${AI_OPTIMIZER_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      # First boot runs the demo seed (up to ~1M rows) before accepting TCP
+      # connections; generous start_period so the backend waits it out instead
+      # of the DB being marked unhealthy.
+      start_period: 180s
+
+  backend:
+    build: ./backend
+    container_name: ai-opt-backend
+    env_file: .env                      # DATABASE_URL (storage) + TARGET_DATABASE_URL (analysed DB)
+    ports:
+      - "127.0.0.1:8000:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # so TARGET_DATABASE_URL can reach your host Postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ai-service:
+        condition: service_started
+    volumes:
+      - ./backend:/app
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  ai-service:
+    build: ./ai-service
+    container_name: ai-opt-ai
+    env_file: .env
+    restart: unless-stopped       # embedding model load can fail transiently; retry
+    ports:
+      - "127.0.0.1:5000:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./ai-service:/app
+
+  frontend:
+    build: ./frontend
+    container_name: ai-opt-frontend
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      - backend
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    command: npm run dev -- --host 0.0.0.0 --port 8080
+
+volumes:
+  pgdata_ai_optimizer:                  # separate from the demo `pgdata` volume
