@@ -93,6 +93,15 @@ target_pool: asyncpg.Pool = None
 # Detected per target so the tool works on PG12 through PG17.
 PSS = {"mean": "mean_time", "total": "total_time"}
 
+# pg_stat_statements is CLUSTER-WIDE: a single view that aggregates statements
+# from EVERY database in the cluster. Left unfiltered, cards would show queries
+# from sibling DBs (e.g. jewel_kamadhenu) even when you're analysing trade_api.
+# Scope every read to the connected database via its dbid so each card only ever
+# reflects the DB shown in the switcher. (All other stat sources the app uses —
+# pg_statio_user_tables, pg_stat_user_tables, information_schema — are already
+# per-database, so they need no such filter.)
+PSS_DB_FILTER = "dbid = (SELECT oid FROM pg_database WHERE datname = current_database())"
+
 async def detect_pss_columns(p: asyncpg.Pool):
     global PSS
     try:
@@ -239,11 +248,15 @@ async def get_summary():
     async with target_pool.acquire() as conn:
         try:
             slow_count = await conn.fetchval(
-                f"SELECT COUNT(*) FROM pg_stat_statements WHERE {PSS['mean']} > 100"
+                f"SELECT COUNT(*) FROM pg_stat_statements "
+                f"WHERE {PSS_DB_FILTER} AND {PSS['mean']} > 100"
             )
-            total_queries = await conn.fetchval("SELECT COUNT(*) FROM pg_stat_statements")
+            total_queries = await conn.fetchval(
+                f"SELECT COUNT(*) FROM pg_stat_statements WHERE {PSS_DB_FILTER}"
+            )
             avg_latency = await conn.fetchval(
-                f"SELECT COALESCE(AVG({PSS['mean']}), 0) FROM pg_stat_statements"
+                f"SELECT COALESCE(AVG({PSS['mean']}), 0) FROM pg_stat_statements "
+                f"WHERE {PSS_DB_FILTER}"
             )
         except asyncpg.UndefinedTableError:
             slow_count, total_queries, avg_latency = 0, 0, 0
@@ -336,7 +349,7 @@ async def get_slow_queries(threshold_ms: float = 100.0, limit: int = 20):
                        {PSS['mean']} AS mean_time, rows,
                        shared_blks_hit, shared_blks_read
                 FROM pg_stat_statements
-                WHERE {PSS['mean']} > $1
+                WHERE {PSS_DB_FILTER} AND {PSS['mean']} > $1
                 ORDER BY {PSS['mean']} DESC
                 LIMIT $2
             """, threshold_ms, limit)
@@ -367,7 +380,8 @@ async def analyze_query(queryid: int, background_tasks: BackgroundTasks):
     # 1. Read the query text + its plan from the TARGET (read-only) database.
     async with target_pool.acquire() as tconn:
         row = await tconn.fetchrow(
-            "SELECT query FROM pg_stat_statements WHERE queryid = $1", queryid
+            f"SELECT query FROM pg_stat_statements "
+            f"WHERE {PSS_DB_FILTER} AND queryid = $1", queryid
         )
         if not row:
             raise HTTPException(status_code=404, detail="Query not found")
@@ -622,6 +636,7 @@ async def snapshot_queries():
                    {PSS['mean']} AS mean_time, rows,
                    shared_blks_hit, shared_blks_read
             FROM pg_stat_statements
+            WHERE {PSS_DB_FILTER}
         """)
     async with pool.acquire() as sconn:
         await sconn.executemany("""
@@ -880,7 +895,8 @@ async def deep_analyze_query(queryid: int):
     """EXPLAIN ANALYZE (SELECT-only, timeout-guarded) + divergence + sargability lint."""
     async with target_pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT query FROM pg_stat_statements WHERE queryid = $1", queryid)
+            f"SELECT query FROM pg_stat_statements "
+            f"WHERE {PSS_DB_FILTER} AND queryid = $1", queryid)
         if not row:
             raise HTTPException(status_code=404, detail="Query not found")
         query = row["query"]
@@ -1015,7 +1031,7 @@ async def run_full_audit(background_tasks: BackgroundTasks, threshold_ms: float 
         try:
             slow = await conn.fetch(f"""
                 SELECT queryid, query, calls, {PSS['mean']} AS mean_time FROM pg_stat_statements
-                WHERE {PSS['mean']} > $1 ORDER BY {PSS['mean']} DESC LIMIT 20
+                WHERE {PSS_DB_FILTER} AND {PSS['mean']} > $1 ORDER BY {PSS['mean']} DESC LIMIT 20
             """, threshold_ms)
         except asyncpg.UndefinedTableError:
             slow = []

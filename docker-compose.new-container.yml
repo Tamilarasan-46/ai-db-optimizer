@@ -90,7 +90,7 @@ services:
     build: ./frontend
     container_name: ai-opt-frontend
     ports:
-      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:8090:8080"    # host port moved 8080→8090 so Jewel vue-cli owns 8080 (revert to 8080 when done)
     depends_on:
       - backend
     volumes:
