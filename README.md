@@ -24,6 +24,10 @@ whole pipeline work before touching your own data.
 > First boot takes a few minutes: it seeds the demo dataset and downloads the
 > embedding model (~80 MB), one time.
 
+> **Want a public instance?** See **[DEPLOY.md](DEPLOY.md)** — a step-by-step guide
+> to host a locked-down public demo for free (Oracle Cloud Always-Free VM + automatic
+> HTTPS), plus every deploy command and a troubleshooting playbook.
+
 ## 2. Connect YOUR database
 
 ### Option A — from the UI (fastest)

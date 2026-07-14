@@ -30,6 +30,18 @@ TARGET_DATABASE_URL = os.getenv("TARGET_DATABASE_URL", "")
 AI_SERVICE_URL = os.getenv("AI_SERVICE_URL", "http://localhost:5000")
 EXPLAIN_ANALYZE = os.getenv("EXPLAIN_ANALYZE", "false").lower() in ("1", "true", "yes")
 
+# PUBLIC_DEMO -> hardening for a publicly-hosted instance that strangers use:
+#   * ignores TARGET_DATABASE_URL and analyses ONLY the bundled demo DB (self mode)
+#   * disables POST /api/target/connect so visitors can't point the server at
+#     an arbitrary host (credential-probing / SSRF) or run load against real DBs
+# Leave it off (default) for self-hosting, where full features are wanted.
+PUBLIC_DEMO = os.getenv("PUBLIC_DEMO", "false").lower() in ("1", "true", "yes")
+
+# ALLOWED_ORIGINS -> comma-separated CORS allowlist (e.g. "https://optimizer.example.com").
+# Defaults to "*" for local/self-host convenience; set it on a public instance.
+_origins = os.getenv("ALLOWED_ORIGINS", "*").strip()
+ALLOWED_ORIGINS = ["*"] if _origins == "*" else [o.strip() for o in _origins.split(",") if o.strip()]
+
 # ── Pydantic Models ────────────────────────────────────────────────────────
 class SlowQuery(BaseModel):
     # String, not int: pg_stat_statements queryid is a 64-bit value that exceeds
@@ -102,6 +114,17 @@ PSS = {"mean": "mean_time", "total": "total_time"}
 # per-database, so they need no such filter.)
 PSS_DB_FILTER = "dbid = (SELECT oid FROM pg_database WHERE datname = current_database())"
 
+# The optimizer's OWN work (EXPLAIN/ANALYZE it runs while auditing) and utility/
+# maintenance statements get recorded in pg_stat_statements too. They can't be
+# re-analysed (you can't EXPLAIN an EXPLAIN, ANALYZE, VACUUM, …), so clicking them
+# in the UI just errors. Exclude them from the slow-query surfaces so the list
+# only shows statements the tool can actually act on (SELECT/WITH/INSERT/…).
+PSS_ANALYZABLE = (
+    r"query !~* '^\s*(EXPLAIN|ANALYZE|VACUUM|SET|SHOW|BEGIN|COMMIT|ROLLBACK|"
+    r"DEALLOCATE|CHECKPOINT|COPY|CLUSTER|REINDEX|GRANT|REVOKE|PREPARE|EXECUTE|"
+    r"DISCARD|LISTEN|NOTIFY|CREATE|DROP|ALTER|TRUNCATE|COMMENT|REFRESH)\y'"
+)
+
 async def detect_pss_columns(p: asyncpg.Pool):
     global PSS
     try:
@@ -115,7 +138,21 @@ async def detect_pss_columns(p: asyncpg.Pool):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global pool, target_pool
-    pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
+    # On a fresh stack the database may still be initialising (first boot loads
+    # the demo seed) or restarting, so its TCP listener isn't up yet. Retry with
+    # backoff instead of crashing — otherwise the backend crash-loops until the
+    # DB happens to be ready. Covers ~2 min, matching the DB's start_period.
+    pool = None
+    for attempt in range(1, 41):
+        try:
+            pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
+            break
+        except (OSError, asyncpg.PostgresError) as e:
+            if attempt == 40:
+                print(f"[startup] DB still unreachable after {attempt} tries — giving up.")
+                raise
+            print(f"[startup] DB not ready (attempt {attempt}/40: {e}); retrying in 3s…")
+            await asyncio.sleep(3)
 
     # Initialize schema if needed
     async with pool.acquire() as conn:
@@ -185,7 +222,11 @@ async def lifespan(app: FastAPI):
     # Open the read-only analysis connection to the target (working) database.
     # `default_transaction_read_only` is a hard guard: even EXPLAIN ANALYZE of a
     # write statement will be refused, so we can never mutate your working DB.
-    if TARGET_DATABASE_URL:
+    if PUBLIC_DEMO:
+        # Public instance: never touch an external DB — analyse our own demo DB.
+        target_pool = pool
+        print("[info] PUBLIC_DEMO on — analysing the bundled demo database only.")
+    elif TARGET_DATABASE_URL:
         try:
             target_pool = await asyncpg.create_pool(
                 TARGET_DATABASE_URL,
@@ -213,7 +254,7 @@ app = FastAPI(title="AI Database Optimizer API", version="1.0.0", lifespan=lifes
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -249,7 +290,7 @@ async def get_summary():
         try:
             slow_count = await conn.fetchval(
                 f"SELECT COUNT(*) FROM pg_stat_statements "
-                f"WHERE {PSS_DB_FILTER} AND {PSS['mean']} > 100"
+                f"WHERE {PSS_DB_FILTER} AND {PSS_ANALYZABLE} AND {PSS['mean']} > 100"
             )
             total_queries = await conn.fetchval(
                 f"SELECT COUNT(*) FROM pg_stat_statements WHERE {PSS_DB_FILTER}"
@@ -349,7 +390,7 @@ async def get_slow_queries(threshold_ms: float = 100.0, limit: int = 20):
                        {PSS['mean']} AS mean_time, rows,
                        shared_blks_hit, shared_blks_read
                 FROM pg_stat_statements
-                WHERE {PSS_DB_FILTER} AND {PSS['mean']} > $1
+                WHERE {PSS_DB_FILTER} AND {PSS_ANALYZABLE} AND {PSS['mean']} > $1
                 ORDER BY {PSS['mean']} DESC
                 LIMIT $2
             """, threshold_ms, limit)
@@ -1031,7 +1072,7 @@ async def run_full_audit(background_tasks: BackgroundTasks, threshold_ms: float 
         try:
             slow = await conn.fetch(f"""
                 SELECT queryid, query, calls, {PSS['mean']} AS mean_time FROM pg_stat_statements
-                WHERE {PSS_DB_FILTER} AND {PSS['mean']} > $1 ORDER BY {PSS['mean']} DESC LIMIT 20
+                WHERE {PSS_DB_FILTER} AND {PSS_ANALYZABLE} AND {PSS['mean']} > $1 ORDER BY {PSS['mean']} DESC LIMIT 20
             """, threshold_ms)
         except asyncpg.UndefinedTableError:
             slow = []
@@ -1185,6 +1226,11 @@ async def target_connect(req: SwitchRequest):
     Always read-only (default_transaction_read_only=on).
     """
     global target_pool, CURRENT_TARGET_URL
+    if PUBLIC_DEMO:
+        raise HTTPException(
+            status_code=403,
+            detail="Connecting external databases is disabled on the public demo. "
+                   "Self-host (docker compose up) to analyse your own database.")
     if not re.fullmatch(r"[A-Za-z0-9_\-]+", req.database):
         raise HTTPException(status_code=400, detail="Invalid database name.")
 
