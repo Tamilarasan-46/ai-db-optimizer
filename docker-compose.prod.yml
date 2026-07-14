@@ -1,0 +1,110 @@
+# ============================================================================
+# AI Database Optimizer — PRODUCTION stack (public demo)
+# ----------------------------------------------------------------------------
+# Differences vs docker-compose.yml (dev):
+#   * frontend is a BUILT static bundle served by nginx (no vite dev server)
+#   * NO source-code bind mounts, NO --reload (immutable images)
+#   * Caddy terminates HTTPS automatically (Let's Encrypt) for your domain
+#   * PUBLIC_DEMO=true hardens the backend: demo DB only, /target/connect off
+#   * only Caddy publishes ports (80/443); everything else is internal
+#
+# Deploy:
+#   cp .env.prod.example .env      # then edit DOMAIN + passwords + ALLOWED_ORIGINS
+#   docker compose -f docker-compose.prod.yml up -d --build
+#
+# See DEPLOY.md for the full walkthrough (free Oracle Cloud VM, DNS, etc.).
+# ============================================================================
+
+services:
+  postgres:
+    # The PG major version is welded to the data volume: a volume initialised by
+    # pg12 CANNOT be opened by pg16 (Postgres aborts with "database files are
+    # incompatible with server"). So PG_IMAGE_TAG is pinned to pg16 here and the
+    # prod volume (pgdata_ai_optimizer_prod) is SEPARATE from the dev/pg12 stacks
+    # so they can never clash. To move to a new PG major later: pg_dump the old
+    # volume, bump the tag, restore — or (demo/self storage is disposable) just
+    # `docker volume rm` the prod volume and let it re-seed fresh.
+    image: pgvector/pgvector:${PG_IMAGE_TAG:-pg16}
+    container_name: ai-opt-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_SUPERUSER_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:?set a strong password in .env}
+      POSTGRES_DB: ${AI_OPTIMIZER_DB:-ai_optimizer_db}
+      AI_OPTIMIZER_USER: ${AI_OPTIMIZER_USER:-ai_optimizer_user}
+      AI_OPTIMIZER_PASSWORD: ${AI_OPTIMIZER_PASSWORD:?set a strong password in .env}
+    volumes:
+      - pgdata_ai_optimizer_prod:/var/lib/postgresql/data   # prod-only volume; never shared with the pg12 dev stack
+      - ./db-init-container:/docker-entrypoint-initdb.d
+      - ./seed-ai-optimizer-db.sql:/seed/seed-ai-optimizer-db.sql:ro
+    command: >
+      postgres
+      -c shared_preload_libraries=pg_stat_statements
+      -c pg_stat_statements.track=all
+    healthcheck:
+      # -h 127.0.0.1 forces a TCP check: during first-boot init Postgres listens
+      # only on its unix socket, so a socket-based check would report "healthy"
+      # before the backend can actually connect over TCP. This waits for real TCP.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U ${POSTGRES_SUPERUSER_USER:-postgres} -d ${AI_OPTIMIZER_DB:-ai_optimizer_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 180s
+
+  ai-service:
+    build: ./ai-service
+    container_name: ai-opt-ai
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  backend:
+    build: ./backend
+    container_name: ai-opt-backend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      PUBLIC_DEMO: "true"          # <- public hardening: demo DB only, connect disabled
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ai-service:
+        condition: service_started
+    # Single worker on purpose: the app runs CREATE TABLE IF NOT EXISTS at
+    # startup, and multiple workers racing that DDL trip Postgres' concurrent-
+    # create bug ("duplicate key ... pg_type"). One worker easily handles a demo.
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.prod
+    container_name: ai-opt-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: ai-opt-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      # Blank in .env -> ":80" (plain HTTP, local/by-IP). Set SITE_ADDRESS to a
+      # hostname (e.g. 152-67-10-20.sslip.io) -> Caddy serves auto-HTTPS.
+      SITE_ADDRESS: ${SITE_ADDRESS:-:80}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - frontend
+
+volumes:
+  pgdata_ai_optimizer_prod:      # isolated from dev/new-container (pg12) volumes
+  caddy_data:
+  caddy_config:

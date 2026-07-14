@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+!.env.prod.example
 # private machine-specific setup notes (contain real credentials)
 SETUP-CHECKLIST.md
 

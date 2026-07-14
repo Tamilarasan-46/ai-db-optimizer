@@ -1,0 +1,19 @@
+# The site address comes from SITE_ADDRESS (set in .env, passed by compose):
+#   * unset / ":80"            -> plain HTTP on port 80 (local test, or access by IP)
+#   * a hostname (e.g. foo.sslip.io or your domain) -> automatic HTTPS via Let's
+#     Encrypt; Caddy fetches + renews the cert on its own once DNS points here.
+# Serves the built frontend and forwards /api to the backend.
+
+{$SITE_ADDRESS} {
+    encode gzip
+
+    # API -> FastAPI backend
+    handle /api/* {
+        reverse_proxy backend:8000
+    }
+
+    # Everything else -> nginx serving the built SPA
+    handle {
+        reverse_proxy frontend:80
+    }
+}

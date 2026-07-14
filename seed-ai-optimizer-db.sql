@@ -71,7 +71,9 @@ ON CONFLICT DO NOTHING;
 
 INSERT INTO orders (customer_id, total, status, created_at)
 SELECT
-    (random() * 50000)::int + 1,
+    -- floor()+1 keeps this in 1..50000 (customers' id range). Plain
+    -- (random()*50000)::int rounds up to 50001 sometimes -> FK violation.
+    (floor(random() * 50000) + 1)::int,
     (random() * 500)::numeric(10,2),
     CASE (random() * 3)::int WHEN 0 THEN 'pending' WHEN 1 THEN 'shipped' ELSE 'delivered' END,
     NOW() - (random() * interval '365 days')
@@ -97,6 +99,22 @@ SELECT count(*) FROM orders  WHERE status = 'pending';
 SELECT count(*) FROM orders  WHERE customer_id = 12345;
 SELECT count(*) FROM events  WHERE type = 'purchase';
 SELECT c.country, count(*) FROM orders o JOIN customers c ON c.id = o.customer_id GROUP BY c.country;
+
+-- Heavier statements so at least one crosses the 100ms "slow" threshold the
+-- dashboard filters on (unindexed self-join + big grouped aggregate/sort).
+SELECT o.status, c.country, count(*), round(avg(o.total), 2) AS avg_total
+FROM orders o JOIN customers c ON c.id = o.customer_id
+GROUP BY o.status, c.country
+ORDER BY count(*) DESC;
+SELECT payload->>'user_id' AS uid, count(*)
+FROM events
+GROUP BY uid
+ORDER BY count(*) DESC
+LIMIT 20;
+SELECT status, count(*), sum(total)
+FROM orders
+WHERE created_at::date >= '2025-01-01'   -- non-sargable cast on purpose (audit flags this)
+GROUP BY status;
 
 -- NOTE: pg_stat_statements_reset() is intentionally NOT called here — it
 -- requires pg_monitor / superuser, which ai_optimizer_user does not have.
